@@ -23,13 +23,14 @@ import requests
 import logging
 import time
 import datetime
+import socket
 from fluent import asyncsender as asycsender
 
 
 from utils.args_parser import ArgsParser
 from utils.config_parser import ConfigParser
 from utils.logger import Logger
-
+from utils.utils import Utils
 
 class UFMTelemetryConstants:
     PLUGIN_NAME = "UFM_Telemetry_Streaming"
@@ -178,6 +179,36 @@ class UFMTelemetryStreamingConfigParser(ConfigParser):
         return aliases,custom
 
 
+class FluentdStreamingSender(asycsender.FluentSender):
+    def __init__(self,
+                 tag,
+                 host='localhost',
+                 port=24224,
+                 timeout=3.0,
+                 **kwargs):
+        super(FluentdStreamingSender,self).__init__(tag=tag,host=host,port=port,timeout=timeout,**kwargs)
+        self.ipv6 = Utils.is_ipv6_address(host)
+
+    def _reconnect(self):
+        if self.ipv6:
+            if not self.socket:
+                try:
+                    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                    sock.settimeout(self.timeout)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    sock.connect((self.host, self.port))
+                except Exception as e:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    raise e
+                else:
+                    self.socket = sock
+        else:
+            super(FluentdStreamingSender, self)._reconnect()
+
+
 class UFMTelemetryStreaming:
 
     def __init__(self, config_parser):
@@ -198,14 +229,15 @@ class UFMTelemetryStreaming:
         self.fluentd_msg_tag = self.config_parser.get_fluentd_msg_tag(self.ufm_telemetry_host)
 
     def _get_metrics(self):
-        url = f'http://{self.ufm_telemetry_host}:{self.ufm_telemetry_port}/{self.ufm_telemetry_url}'
+        _host = f'[{self.ufm_telemetry_host}]' if Utils.is_ipv6_address(self.ufm_telemetry_host) else self.ufm_telemetry_host
+        url = f'http://{_host}:{self.ufm_telemetry_port}/{self.ufm_telemetry_url}'
         logging.info(f'Send UFM Telemetry Endpoint Request, Method: GET, URL: {url}')
         try:
             response = requests.get(url)
             return response.text
         except Exception as e:
             logging.error(e)
-            return response
+            return None
 
     def _parse_telemetry_csv_metrics_to_json(self, data, line_separator = "\n", attrs_sepatator = ","):
         rows = data.split(line_separator)
@@ -233,7 +265,7 @@ class UFMTelemetryStreaming:
     def _stream_data_to_fluentd(self, data_to_stream):
         logging.info(f'Streaming to Fluentd IP: {self.fluentd_host} port: {self.fluentd_port} timeout: {self.fluentd_timeout}')
         try:
-            fluent_sender = asycsender.FluentSender(UFMTelemetryConstants.PLUGIN_NAME,
+            fluent_sender = FluentdStreamingSender(UFMTelemetryConstants.PLUGIN_NAME,
                                                     self.fluentd_host,
                                                     self.fluentd_port, timeout=self.fluentd_timeout)
 
@@ -251,12 +283,15 @@ class UFMTelemetryStreaming:
 
     def stream_data(self):
         telemetry_data = self._get_metrics()
-        data_to_stream = self._parse_telemetry_csv_metrics_to_json(telemetry_data)
-        if self.bulk_streaming_flag:
-            self._stream_data_to_fluentd(data_to_stream)
+        if telemetry_data:
+            data_to_stream = self._parse_telemetry_csv_metrics_to_json(telemetry_data)
+            if self.bulk_streaming_flag:
+                self._stream_data_to_fluentd(data_to_stream)
+            else:
+                for row in data_to_stream:
+                    self._stream_data_to_fluentd(row)
         else:
-            for row in data_to_stream:
-                self._stream_data_to_fluentd(row)
+            logging.error("Failed to get the telemetry data")
 
 if __name__ == "__main__":
     # init app args
